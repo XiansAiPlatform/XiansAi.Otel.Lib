@@ -1,0 +1,17 @@
+{
+  "activitySources": [
+    "XiansAi.*",
+    "Temporal.*",
+    "XiansAi.Temporal",
+    "MongoDB.Driver.Core",
+    "Microsoft.SemanticKernel.*",
+    "XiansAi.SemanticKernel"
+  ],
+  "meters": [
+    "XiansAi.*",
+    "Temporal.*",
+    "Microsoft.SemanticKernel*"
+  ]
+}
+
+

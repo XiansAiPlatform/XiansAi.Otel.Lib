@@ -1,0 +1,33 @@
+# Build outputs
+bin/
+obj/
+
+# NuGet artifacts
+*.nupkg
+*.snupkg
+
+# User-specific files
+*.user
+*.suo
+
+bin/
+obj/
+TestResults/
+.vs/
+*.user
+*.suo
+*.userprefs
+*.log
+*.ide/
+.idea/
+.vscode/
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+
+# Build artifacts
+/artifacts/
+
+

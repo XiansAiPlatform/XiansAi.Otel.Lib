@@ -1,0 +1,419 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using OpenTelemetry;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+
+namespace XiansAi.Otel;
+
+/// <summary>
+/// Entry points for configuring OpenTelemetry for XiansAi services and agents.
+/// </summary>
+public static class TelemetryBuilder
+{
+    /// <summary>
+    /// Generic initialization for any process/agent.
+    /// - Uses OPENTELEMETRY_ENDPOINT as the enable/disable switch (required for traces/metrics).
+    /// - Uses OPENTELEMETRY_LOGS_ENDPOINT (optional) for logs; falls back to OPENTELEMETRY_ENDPOINT.
+    /// - Sets OTEL service.name to "&lt;tenantId&gt;/&lt;serviceName&gt;" if tenantId is provided.
+    /// - Adds any extra resource attributes provided.
+    /// - Still allows OPENTELEMETRY_SERVICE_NAME to override the computed service name.
+    /// </summary>
+    public static ILoggerFactory? InitializeAgent(
+        string? tenantId,
+        string serviceName,
+        IDictionary<string, object>? resourceAttributes = null,
+        IEnumerable<string>? additionalActivitySources = null,
+        IEnumerable<string>? additionalMeters = null,
+        bool enableLogs = true)
+    {
+        // Optional: enable Semantic Kernel GenAI sensitive event content (prompts/responses) when explicitly requested.
+        // This affects `gen_ai.*` events such as `gen_ai.event.content` and should be enabled only in trusted/dev environments.
+        if (IsTruthyEnv("OPENTELEMETRY_GENAI_SENSITIVE"))
+        {
+            AppContext.SetSwitch("Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive", true);
+        }
+
+        if (string.IsNullOrWhiteSpace(serviceName))
+        {
+            throw new ArgumentException("serviceName must be provided", nameof(serviceName));
+        }
+
+        var computedServiceName =
+            !string.IsNullOrWhiteSpace(tenantId)
+                ? $"{tenantId}/{serviceName}"
+                : serviceName;
+
+        // Allow env override to win (useful for debugging and ad-hoc runs)
+        var effectiveServiceName =
+            Environment.GetEnvironmentVariable("OPENTELEMETRY_SERVICE_NAME")
+            ?? computedServiceName;
+
+        var instrumentation = LoadInstrumentationConfig();
+
+        InitializeFromEnvironment(
+            defaultServiceName: effectiveServiceName,
+            tenantId: tenantId,
+            resourceAttributes: resourceAttributes,
+            additionalActivitySources: MergeList(instrumentation.ActivitySources, additionalActivitySources),
+            additionalMeters: MergeList(instrumentation.Meters, additionalMeters));
+
+        if (!enableLogs)
+        {
+            return null;
+        }
+
+        return CreateLoggerFactoryFromEnvironment(effectiveServiceName, tenantId, resourceAttributes);
+    }
+
+    private static bool IsTruthyEnv(string key)
+    {
+        var v = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(v)) return false;
+        return v.Equals("1", StringComparison.OrdinalIgnoreCase)
+               || v.Equals("true", StringComparison.OrdinalIgnoreCase)
+               || v.Equals("yes", StringComparison.OrdinalIgnoreCase)
+               || v.Equals("on", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void InitializeFromEnvironment(
+        string? defaultServiceName = null,
+        string? tenantId = null,
+        IDictionary<string, object>? resourceAttributes = null,
+        IEnumerable<string>? additionalActivitySources = null,
+        IEnumerable<string>? additionalMeters = null)
+    {
+        var serviceName = Environment.GetEnvironmentVariable("OPENTELEMETRY_SERVICE_NAME")
+                          ?? defaultServiceName
+                          ?? "XiansAi.Agent";
+
+        var serviceVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
+        var otlpEndpoint = Environment.GetEnvironmentVariable("OPENTELEMETRY_ENDPOINT");
+
+        if (string.IsNullOrWhiteSpace(otlpEndpoint))
+        {
+            Console.WriteLine("[OpenTelemetry] Telemetry is disabled because OPENTELEMETRY_ENDPOINT is not set. Set it to enable traces/metrics export.");
+            return;
+        }
+
+        Console.WriteLine($"[OpenTelemetry] Initializing OpenTelemetry for service: {serviceName}");
+        Console.WriteLine($"[OpenTelemetry] OTLP Endpoint: {otlpEndpoint}");
+
+        try
+        {
+            var attrs = new Dictionary<string, object>
+            {
+                ["deployment.environment"] = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Development",
+                ["host.name"] = Environment.MachineName,
+            };
+
+            if (!string.IsNullOrWhiteSpace(tenantId))
+            {
+                attrs["tenant.id"] = tenantId!;
+            }
+
+            if (resourceAttributes != null)
+            {
+                foreach (var kv in resourceAttributes)
+                {
+                    // Last write wins
+                    attrs[kv.Key] = kv.Value;
+                }
+            }
+
+            var resourceBuilder = ResourceBuilder.CreateDefault()
+                .AddService(
+                    serviceName: serviceName,
+                    serviceVersion: serviceVersion,
+                    serviceInstanceId: Environment.MachineName)
+                .AddAttributes(attrs);
+
+            var tracerBuilder = Sdk.CreateTracerProviderBuilder()
+                .SetResourceBuilder(resourceBuilder)
+                .AddSource("XiansAi.*")
+                .AddHttpClientInstrumentation(options =>
+                {
+                    options.RecordException = true;
+                })
+                .AddOtlpExporter(options =>
+                {
+                    options.Endpoint = new Uri(otlpEndpoint);
+                    options.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.Grpc;
+                });
+
+            if (additionalActivitySources != null)
+            {
+                foreach (var src in additionalActivitySources)
+                {
+                    if (!string.IsNullOrWhiteSpace(src))
+                    {
+                        tracerBuilder.AddSource(src);
+                    }
+                }
+            }
+
+            // If Temporal TracingInterceptor is present, explicitly subscribe to its ActivitySources.
+            // This avoids missing workflow/activity spans when wildcard patterns don't match.
+            TryAddTemporalTracingInterceptorSources(tracerBuilder);
+
+            tracerBuilder.Build();
+
+            var meterBuilder = Sdk.CreateMeterProviderBuilder()
+                .SetResourceBuilder(resourceBuilder)
+                .AddHttpClientInstrumentation()
+                .AddRuntimeInstrumentation()
+                .AddMeter("XiansAi.*")
+                .AddOtlpExporter(options =>
+                {
+                    options.Endpoint = new Uri(otlpEndpoint);
+                    options.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.Grpc;
+                })
+                ;
+
+            if (additionalMeters != null)
+            {
+                foreach (var m in additionalMeters)
+                {
+                    if (!string.IsNullOrWhiteSpace(m))
+                    {
+                        meterBuilder.AddMeter(m);
+                    }
+                }
+            }
+
+            meterBuilder.Build();
+
+            Console.WriteLine($"[OpenTelemetry] ✓ OpenTelemetry fully enabled for {serviceName}");
+            Console.WriteLine($"[OpenTelemetry]   - Service: {serviceName} v{serviceVersion}");
+            Console.WriteLine($"[OpenTelemetry]   - OTLP Endpoint: {otlpEndpoint}");
+            Console.WriteLine("[OpenTelemetry]   - Note: If collector is unreachable, traces/metrics will be buffered or dropped (non-blocking)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[OpenTelemetry] ⚠ WARNING: Failed to initialize OpenTelemetry: {ex.Message}");
+            Console.WriteLine("[OpenTelemetry] ⚠ Application will continue without telemetry export");
+        }
+    }
+
+    private sealed class InstrumentationConfig
+    {
+        public List<string> ActivitySources { get; set; } = new();
+        public List<string> Meters { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Load default sources/meters from an embedded JSON shipped with this library.
+    /// </summary>
+    private static InstrumentationConfig LoadInstrumentationConfig()
+    {
+        var config = LoadEmbeddedDefaults();
+
+        config.ActivitySources = config.ActivitySources.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList();
+        config.Meters = config.Meters.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList();
+        return config;
+    }
+
+    private static IEnumerable<string>? MergeList(IEnumerable<string>? a, IEnumerable<string>? b)
+    {
+        if (a == null) return b;
+        if (b == null) return a;
+        return a.Concat(b);
+    }
+
+    private static InstrumentationConfig LoadEmbeddedDefaults()
+    {
+        try
+        {
+            var asm = typeof(TelemetryBuilder).Assembly;
+            // Resource name ends with Defaults.otel-defaults.json (namespace prefix is compiler-generated)
+            var resourceName = asm.GetManifestResourceNames()
+                .FirstOrDefault(n => n.EndsWith("Defaults.otel-defaults.json", StringComparison.OrdinalIgnoreCase));
+
+            if (resourceName == null)
+            {
+                return new InstrumentationConfig();
+            }
+
+            using var stream = asm.GetManifestResourceStream(resourceName);
+            if (stream == null)
+            {
+                return new InstrumentationConfig();
+            }
+
+            using var reader = new StreamReader(stream);
+            var json = reader.ReadToEnd();
+            return ParseInstrumentationJson(json) ?? new InstrumentationConfig();
+        }
+        catch
+        {
+            return new InstrumentationConfig();
+        }
+    }
+
+    private static InstrumentationConfig? ParseInstrumentationJson(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var cfg = new InstrumentationConfig();
+
+            if (root.TryGetProperty("activitySources", out var sourcesEl) && sourcesEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in sourcesEl.EnumerateArray())
+                {
+                    if (el.ValueKind == JsonValueKind.String)
+                    {
+                        cfg.ActivitySources.Add(el.GetString() ?? "");
+                    }
+                }
+            }
+
+            if (root.TryGetProperty("meters", out var metersEl) && metersEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in metersEl.EnumerateArray())
+                {
+                    if (el.ValueKind == JsonValueKind.String)
+                    {
+                        cfg.Meters.Add(el.GetString() ?? "");
+                    }
+                }
+            }
+
+            return cfg;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Creates an <see cref="ILoggerFactory"/> that exports logs via OTLP.
+    /// Endpoint selection:
+    /// - If OPENTELEMETRY_LOGS_ENDPOINT is set, use it
+    /// - else if OPENTELEMETRY_ENDPOINT is set, use it
+    /// - else logs export is disabled (console-only if you also add console provider)
+    /// </summary>
+    private static ILoggerFactory CreateLoggerFactoryFromEnvironment(
+        string? defaultServiceName,
+        string? tenantId,
+        IDictionary<string, object>? resourceAttributes)
+    {
+        var serviceName = Environment.GetEnvironmentVariable("OPENTELEMETRY_SERVICE_NAME")
+                          ?? defaultServiceName
+                          ?? "XiansAi.Agent";
+
+        var serviceVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
+
+        var logsEndpoint =
+            Environment.GetEnvironmentVariable("OPENTELEMETRY_LOGS_ENDPOINT")
+            ?? Environment.GetEnvironmentVariable("OPENTELEMETRY_ENDPOINT");
+
+        return LoggerFactory.Create(builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Trace);
+
+            // OTEL logs export is optional (endpoint-driven).
+            if (string.IsNullOrWhiteSpace(logsEndpoint))
+            {
+                Console.WriteLine("[OpenTelemetry] Logs export is disabled because OPENTELEMETRY_LOGS_ENDPOINT/OPENTELEMETRY_ENDPOINT is not set.");
+                return;
+            }
+
+            builder.AddOpenTelemetry(options =>
+            {
+                var attrs = new Dictionary<string, object>();
+                if (!string.IsNullOrWhiteSpace(tenantId))
+                {
+                    attrs["tenant.id"] = tenantId!;
+                }
+                if (resourceAttributes != null)
+                {
+                    foreach (var kv in resourceAttributes)
+                    {
+                        attrs[kv.Key] = kv.Value;
+                    }
+                }
+
+                options.SetResourceBuilder(ResourceBuilder.CreateDefault()
+                    .AddService(
+                        serviceName: serviceName,
+                        serviceVersion: serviceVersion,
+                        serviceInstanceId: Environment.MachineName)
+                    .AddAttributes(attrs));
+
+                options.IncludeFormattedMessage = true;
+                options.ParseStateValues = true;
+                options.IncludeScopes = true;
+
+                options.AddOtlpExporter(otlp =>
+                {
+                    otlp.Endpoint = new Uri(logsEndpoint);
+                    otlp.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.Grpc;
+                });
+            });
+
+            Console.WriteLine($"[OpenTelemetry] Logs exporter enabled for service: {serviceName}");
+            Console.WriteLine($"[OpenTelemetry] Logs OTLP Endpoint: {logsEndpoint}");
+        });
+    }
+
+    private static void TryAddTemporalTracingInterceptorSources(TracerProviderBuilder tracerBuilder)
+    {
+        try
+        {
+            var debugEnabled =
+                string.Equals(Environment.GetEnvironmentVariable("OTEL_TEMPORAL_DEBUG"), "1", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(Environment.GetEnvironmentVariable("OTEL_TEMPORAL_DEBUG"), "true", StringComparison.OrdinalIgnoreCase);
+
+            var interceptorType = Type.GetType(
+                "Temporalio.Extensions.OpenTelemetry.TracingInterceptor, Temporalio.Extensions.OpenTelemetry",
+                throwOnError: false);
+
+            if (interceptorType == null)
+            {
+                if (debugEnabled)
+                {
+                    Console.WriteLine("[OTEL][Temporal] TracingInterceptor type not found while adding ActivitySources (agent tracing will miss Temporal spans).");
+                }
+                return;
+            }
+
+            foreach (var fieldName in new[] { "ClientSource", "WorkflowsSource", "ActivitiesSource" })
+            {
+                var field = interceptorType.GetField(fieldName, BindingFlags.Public | BindingFlags.Static);
+                var activitySource = field?.GetValue(null) as System.Diagnostics.ActivitySource;
+                var name = activitySource?.Name;
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    tracerBuilder.AddSource(name);
+                    if (debugEnabled)
+                    {
+                        Console.WriteLine($"[OTEL][Temporal] Subscribed to ActivitySource: {name}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // best-effort: agent telemetry must not break startup
+            var debugEnabled =
+                string.Equals(Environment.GetEnvironmentVariable("OTEL_TEMPORAL_DEBUG"), "1", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(Environment.GetEnvironmentVariable("OTEL_TEMPORAL_DEBUG"), "true", StringComparison.OrdinalIgnoreCase);
+            if (debugEnabled)
+            {
+                Console.WriteLine($"[OTEL][Temporal] Failed while adding TracingInterceptor ActivitySources: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
+}
+
+
+
