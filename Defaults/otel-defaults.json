@@ -3,7 +3,7 @@
     "XiansAi.*",
     "Temporal.*",
     "XiansAi.Temporal",
-    "MongoDB.Driver.Core",
+    "MongoDB.Driver.Core.Extensions.DiagnosticSources",
     "Microsoft.SemanticKernel.*",
     "XiansAi.SemanticKernel"
   ],
