@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
@@ -31,7 +32,8 @@ public static class TelemetryBuilder
         IDictionary<string, object>? resourceAttributes = null,
         IEnumerable<string>? additionalActivitySources = null,
         IEnumerable<string>? additionalMeters = null,
-        bool enableLogs = true)
+        bool enableLogs = true,
+        Func<string?>? tenantIdResolver = null)
     {
         // Optional: enable Semantic Kernel GenAI sensitive event content (prompts/responses) when explicitly requested.
         // This affects `gen_ai.*` events such as `gen_ai.event.content` and should be enabled only in trusted/dev environments.
@@ -62,7 +64,8 @@ public static class TelemetryBuilder
             tenantId: tenantId,
             resourceAttributes: resourceAttributes,
             additionalActivitySources: MergeList(instrumentation.ActivitySources, additionalActivitySources),
-            additionalMeters: MergeList(instrumentation.Meters, additionalMeters));
+            additionalMeters: MergeList(instrumentation.Meters, additionalMeters),
+            tenantIdResolver: tenantIdResolver);
 
         if (!enableLogs)
         {
@@ -88,7 +91,8 @@ public static class TelemetryBuilder
         string? tenantId = null,
         IDictionary<string, object>? resourceAttributes = null,
         IEnumerable<string>? additionalActivitySources = null,
-        IEnumerable<string>? additionalMeters = null)
+        IEnumerable<string>? additionalMeters = null,
+        Func<string?>? tenantIdResolver = null)
     {
         var serviceName = Environment.GetEnvironmentVariable("OPENTELEMETRY_SERVICE_NAME")
                           ?? defaultServiceName
@@ -162,6 +166,14 @@ public static class TelemetryBuilder
             // If Temporal TracingInterceptor is present, explicitly subscribe to its ActivitySources.
             // This avoids missing workflow/activity spans when wildcard patterns don't match.
             TryAddTemporalTracingInterceptorSources(tracerBuilder);
+
+            // Tag every span with the current tenant ID when a resolver is provided.
+            // For multi-tenant template agents, the resolver reads XiansContext.SafeTenantId
+            // from AsyncLocal — available during any workflow/activity execution.
+            if (tenantIdResolver != null)
+            {
+                tracerBuilder.AddProcessor(new TenantTaggingActivityProcessor(tenantIdResolver));
+            }
 
             tracerBuilder.Build();
 
@@ -377,6 +389,46 @@ public static class TelemetryBuilder
 
             Console.WriteLine($"[OpenTelemetry] Logs exporter enabled → {logsEndpoint}");
         });
+    }
+
+    /// <summary>
+    /// The span tag name used for tenant identity.
+    /// Configurable via <c>OPENTELEMETRY_TENANT_TAG_NAME</c>; defaults to <c>tenant.id</c>.
+    /// </summary>
+    internal static string TenantTagName =>
+        Environment.GetEnvironmentVariable("OPENTELEMETRY_TENANT_TAG_NAME")?.Trim()
+        is { Length: > 0 } v ? v : "tenant.id";
+
+    /// <summary>
+    /// Tags every span with the tenant tag by calling the supplied resolver on span start.
+    /// The resolver is expected to be cheap and non-throwing (e.g. reading an AsyncLocal).
+    /// </summary>
+    private sealed class TenantTaggingActivityProcessor : BaseProcessor<Activity>
+    {
+        private readonly Func<string?> _tenantIdResolver;
+        private readonly string _tagName;
+
+        public TenantTaggingActivityProcessor(Func<string?> tenantIdResolver)
+        {
+            _tenantIdResolver = tenantIdResolver;
+            _tagName = TenantTagName;
+        }
+
+        public override void OnStart(Activity activity)
+        {
+            try
+            {
+                var tenantId = _tenantIdResolver();
+                if (!string.IsNullOrWhiteSpace(tenantId))
+                {
+                    activity.SetTag(_tagName, tenantId);
+                }
+            }
+            catch
+            {
+                // Best-effort: processor must never throw or break the span pipeline.
+            }
+        }
     }
 
     private static void TryAddTemporalTracingInterceptorSources(TracerProviderBuilder tracerBuilder)
