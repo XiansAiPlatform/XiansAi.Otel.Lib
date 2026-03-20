@@ -69,8 +69,9 @@ public static class TelemetryBuilder
             return null;
         }
 
-        return CreateLoggerFactoryFromEnvironment(effectiveServiceName, tenantId, resourceAttributes);
+        return BuildLoggerFactory(effectiveServiceName, tenantId, resourceAttributes);
     }
+
 
     private static bool IsTruthyEnv(string key)
     {
@@ -295,20 +296,23 @@ public static class TelemetryBuilder
     }
 
     /// <summary>
-    /// Creates an <see cref="ILoggerFactory"/> that exports logs via OTLP.
-    /// Endpoint selection:
-    /// - If OPENTELEMETRY_LOGS_ENDPOINT is set, use it
-    /// - else if OPENTELEMETRY_ENDPOINT is set, use it
-    /// - else logs export is disabled (console-only if you also add console provider)
+    /// Builds a standalone <see cref="ILoggerFactory"/> suitable for use as a replacement for any
+    /// static logger factory (e.g. Xians.Lib.Common.Infrastructure.LoggerFactory.Instance).
+    /// Always includes console logging. Adds OTLP log export when OPENTELEMETRY_LOGS_ENDPOINT or
+    /// OPENTELEMETRY_ENDPOINT is set; otherwise returns a console-only factory (no-op for OTel).
+    /// <para>
+    /// Call this after env vars are loaded and assign the result to your static logger factory
+    /// before any classes with static readonly ILogger fields are first loaded.
+    /// </para>
     /// </summary>
-    private static ILoggerFactory CreateLoggerFactoryFromEnvironment(
-        string? defaultServiceName,
-        string? tenantId,
-        IDictionary<string, object>? resourceAttributes)
+    public static ILoggerFactory BuildLoggerFactory(
+        string serviceName,
+        string? tenantId = null,
+        IDictionary<string, object>? resourceAttributes = null)
     {
-        var serviceName = Environment.GetEnvironmentVariable("OPENTELEMETRY_SERVICE_NAME")
-                          ?? defaultServiceName
-                          ?? "XiansAi.Agent";
+        var effectiveServiceName =
+            Environment.GetEnvironmentVariable("OPENTELEMETRY_SERVICE_NAME")
+            ?? (!string.IsNullOrWhiteSpace(tenantId) ? $"{tenantId}/{serviceName}" : serviceName);
 
         var serviceVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
 
@@ -318,33 +322,44 @@ public static class TelemetryBuilder
 
         return LoggerFactory.Create(builder =>
         {
-            builder.SetMinimumLevel(LogLevel.Trace);
+            builder.SetMinimumLevel(LogLevel.Information);
 
-            // OTEL logs export is optional (endpoint-driven).
+            builder.AddSimpleConsole(options =>
+            {
+                options.TimestampFormat = "[HH:mm:ss] ";
+                options.SingleLine = true;
+            });
+
             if (string.IsNullOrWhiteSpace(logsEndpoint))
             {
-                Console.WriteLine("[OpenTelemetry] Logs export is disabled because OPENTELEMETRY_LOGS_ENDPOINT/OPENTELEMETRY_ENDPOINT is not set.");
+                Console.WriteLine("[OpenTelemetry] Logs export disabled — OPENTELEMETRY_ENDPOINT not set.");
                 return;
+            }
+
+            var attrs = new Dictionary<string, object>
+            {
+                ["deployment.environment"] = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Development",
+                ["host.name"] = Environment.MachineName,
+            };
+
+            if (!string.IsNullOrWhiteSpace(tenantId))
+            {
+                attrs["tenant.id"] = tenantId!;
+            }
+
+            if (resourceAttributes != null)
+            {
+                foreach (var kv in resourceAttributes)
+                {
+                    attrs[kv.Key] = kv.Value;
+                }
             }
 
             builder.AddOpenTelemetry(options =>
             {
-                var attrs = new Dictionary<string, object>();
-                if (!string.IsNullOrWhiteSpace(tenantId))
-                {
-                    attrs["tenant.id"] = tenantId!;
-                }
-                if (resourceAttributes != null)
-                {
-                    foreach (var kv in resourceAttributes)
-                    {
-                        attrs[kv.Key] = kv.Value;
-                    }
-                }
-
                 options.SetResourceBuilder(ResourceBuilder.CreateDefault()
                     .AddService(
-                        serviceName: serviceName,
+                        serviceName: effectiveServiceName,
                         serviceVersion: serviceVersion,
                         serviceInstanceId: Environment.MachineName)
                     .AddAttributes(attrs));
@@ -360,8 +375,7 @@ public static class TelemetryBuilder
                 });
             });
 
-            Console.WriteLine($"[OpenTelemetry] Logs exporter enabled for service: {serviceName}");
-            Console.WriteLine($"[OpenTelemetry] Logs OTLP Endpoint: {logsEndpoint}");
+            Console.WriteLine($"[OpenTelemetry] Logs exporter enabled → {logsEndpoint}");
         });
     }
 
