@@ -4,6 +4,12 @@
 Enablement is endpoint-driven (`OPENTELEMETRY_ENDPOINT` for traces/metrics, optional `OPENTELEMETRY_LOGS_ENDPOINT` for logs).
 It is designed to work with XiansAi agents but can be used by any .NET app that wants OTEL-compatible exports.
 
+## Install
+
+```bash
+dotnet add package XiansAi.Otel.Lib
+```
+
 ## Automatically captured (out of the box)
 
 - **Traces**: outgoing HTTP via HttpClient (spans + trace propagation)
@@ -95,4 +101,23 @@ To export these spans, pass your source name/pattern via `additionalActivitySour
 
 This library ships a default list via an embedded JSON: `Defaults/otel-defaults.json`.
 To add more sources/meters, pass `additionalActivitySources` / `additionalMeters` to `TelemetryBuilder.InitializeAgent(...)`.
+
+## Package metadata
+
+- Package ID: `XiansAi.Otel.Lib`
+- Target framework: `net9.0`
+- NuGet package includes `README.md` and `LICENSE`
+
+## Release and publish
+
+Publishing is automated with GitHub Actions.
+
+- Trigger: push a tag in the format `v*` (for example `v1.2.3`)
+- Version source: tag value without the `v` prefix
+- Feed: `https://api.nuget.org/v3/index.json`
+- Credential: repository secret `NUGET_API_KEY`
+
+The resulting artifact pushed to NuGet is:
+
+`XiansAi.Otel.Lib.<version>.nupkg`
 
