@@ -18,6 +18,13 @@ dotnet add package XiansAi.Otel.Lib
 - **Temporal traces**: captured **if** `Temporalio.Extensions.OpenTelemetry` is used by the host and the Temporal interceptor is enabled (XiansAi.Lib wires this; generic apps must enable it themselves)
 - **Your own spans**: captured if your code emits `Activity` spans and you include your `ActivitySource` name/pattern in `additionalActivitySources`
 
+## Log sampling (optional)
+
+High log volume from `Information`-level logs can be reduced with two env vars, both defaulting to today's behavior — nothing changes unless you set them:
+
+- `OPENTELEMETRY_LOGS_MIN_LEVEL` (default `Information`): minimum level logged at all. Set to `Warning` to turn off `Information`/`Debug`/`Trace` entirely.
+- `OPENTELEMETRY_LOGS_SAMPLING_RATIO` (default `1.0`, i.e. no sampling): fraction of `Information`-level logs to keep, e.g. `0.1` keeps ~10%. Implemented via .NET's built-in [`Microsoft.Extensions.Telemetry` log sampling](https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/log-sampling). Per Microsoft's own guidance, this only applies to `Information` — `Warning`/`Error`/`Critical` are never sampled, and `Trace`/`Debug` should be turned off via `OPENTELEMETRY_LOGS_MIN_LEVEL` above rather than sampled.
+
 ## GenAI sensitive content events (optional)
 
 If you want Semantic Kernel to include prompt/response **content** in `gen_ai.*` events (e.g. `gen_ai.event.content`), set:

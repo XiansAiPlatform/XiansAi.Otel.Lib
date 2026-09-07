@@ -86,6 +86,40 @@ public static class TelemetryBuilder
                || v.Equals("on", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static double ReadRatioEnv(string key, double defaultValue)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return defaultValue;
+        }
+
+        if (!double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var value))
+        {
+            Console.WriteLine($"[OpenTelemetry] Invalid value for {key}='{raw}' (expected a number between 0 and 1), using default {defaultValue}.");
+            return defaultValue;
+        }
+
+        return Math.Clamp(value, 0.0, 1.0);
+    }
+
+    private static LogLevel ReadLogLevelEnv(string key, LogLevel defaultValue)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return defaultValue;
+        }
+
+        if (!Enum.TryParse<LogLevel>(raw, ignoreCase: true, out var value))
+        {
+            Console.WriteLine($"[OpenTelemetry] Invalid value for {key}='{raw}', using default {defaultValue}.");
+            return defaultValue;
+        }
+
+        return value;
+    }
+
     private static void InitializeFromEnvironment(
         string? defaultServiceName = null,
         string? tenantId = null,
@@ -332,9 +366,23 @@ public static class TelemetryBuilder
             Environment.GetEnvironmentVariable("OPENTELEMETRY_LOGS_ENDPOINT")
             ?? Environment.GetEnvironmentVariable("OPENTELEMETRY_ENDPOINT");
 
+        var minLevel = ReadLogLevelEnv("OPENTELEMETRY_LOGS_MIN_LEVEL", LogLevel.Information);
+        var samplingRatio = ReadRatioEnv("OPENTELEMETRY_LOGS_SAMPLING_RATIO", 1.0);
+
         return LoggerFactory.Create(builder =>
         {
-            builder.SetMinimumLevel(LogLevel.Information);
+            builder.SetMinimumLevel(minLevel);
+
+            if (samplingRatio < 1.0)
+            {
+                // Per Microsoft's log-sampling guidance, sampling is intended for Information-level
+                // logs. Trace/Debug should be turned off via OPENTELEMETRY_LOGS_MIN_LEVEL instead of
+                // sampled, and Warning/Error/Critical are left untouched here.
+                builder.AddRandomProbabilisticSampler(samplingRatio, LogLevel.Information);
+                Console.WriteLine(
+                    $"[OpenTelemetry] Log sampling enabled: keeping {samplingRatio:0.###} of Information-level logs " +
+                    "(Warning and above unaffected).");
+            }
 
             builder.AddSimpleConsole(options =>
             {
