@@ -23,7 +23,13 @@ dotnet add package XiansAi.Otel.Lib
 High log volume from `Information`-level logs can be reduced with two env vars, both defaulting to today's behavior — nothing changes unless you set them:
 
 - `OPENTELEMETRY_LOGS_MIN_LEVEL` (default `Information`): minimum level logged at all. Set to `Warning` to turn off `Information`/`Debug`/`Trace` entirely.
-- `OPENTELEMETRY_LOGS_SAMPLING_RATIO` (default `1.0`, i.e. no sampling): fraction of `Information`-level logs to keep, e.g. `0.1` keeps ~10%. Implemented via .NET's built-in [`Microsoft.Extensions.Telemetry` log sampling](https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/log-sampling). Per Microsoft's own guidance, this only applies to `Information` — `Warning`/`Error`/`Critical` are never sampled, and `Trace`/`Debug` should be turned off via `OPENTELEMETRY_LOGS_MIN_LEVEL` above rather than sampled.
+- `OPENTELEMETRY_LOGS_SAMPLING_MODE` (default `ratio`): which sampling strategy to use — `ratio` or `trace`. Implemented via .NET's built-in [`Microsoft.Extensions.Telemetry` log sampling](https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/log-sampling). In both modes, `Warning`/`Error`/`Critical` are never sampled, and `Trace`/`Debug` should be turned off via `OPENTELEMETRY_LOGS_MIN_LEVEL` above rather than sampled.
+  - `ratio` — an independent random keep/drop decision per `Information` log line. Controlled by `OPENTELEMETRY_LOGS_SAMPLING_RATIO` (default `1.0`, i.e. no sampling), e.g. `0.1` keeps ~10% of `Information` lines. Simple, but a single request's log lines can end up partially kept and partially dropped.
+  - `trace` — keeps or drops **all** logs for a given request together, based on whether that request's trace was sampled. Gives you complete request stories instead of fragments, at the cost of losing whole requests instead of individual lines. This mode only reduces volume if trace sampling itself is also configured — see `OPENTELEMETRY_TRACES_SAMPLING_RATIO` below; otherwise every trace is kept and this is a no-op.
+
+## Trace sampling (optional)
+
+- `OPENTELEMETRY_TRACES_SAMPLING_RATIO` (default `1.0`, i.e. every trace is kept): fraction of root traces to sample, via a `ParentBased(TraceIdRatioBasedSampler)`. A trace whose parent was already sampled in (e.g. propagated from an upstream caller) is always kept regardless of this ratio. This is also what `OPENTELEMETRY_LOGS_SAMPLING_MODE=trace` above relies on to actually reduce log volume.
 
 ## Metrics cardinality (optional)
 
