@@ -86,6 +86,29 @@ public static class TelemetryBuilder
                || v.Equals("on", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Matches the OpenTelemetry .NET SDK's own built-in default (<c>Metric.DefaultCardinalityLimit</c>)
+    /// so that not setting <c>OPENTELEMETRY_METRICS_CARDINALITY_LIMIT</c> preserves current behavior.
+    /// </summary>
+    private const int DefaultMetricsCardinalityLimit = 2000;
+
+    private static int ReadPositiveIntEnv(string key, int defaultValue)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return defaultValue;
+        }
+
+        if (!int.TryParse(raw, out var value) || value <= 0)
+        {
+            Console.WriteLine($"[OpenTelemetry] Invalid value for {key}='{raw}' (expected a positive integer), using default {defaultValue}.");
+            return defaultValue;
+        }
+
+        return value;
+    }
+
     private static double ReadRatioEnv(string key, double defaultValue)
     {
         var raw = Environment.GetEnvironmentVariable(key);
@@ -143,6 +166,8 @@ public static class TelemetryBuilder
 
         Console.WriteLine($"[OpenTelemetry] Initializing OpenTelemetry for service: {serviceName}");
         Console.WriteLine($"[OpenTelemetry] OTLP Endpoint: {otlpEndpoint}");
+
+        var metricsCardinalityLimit = ReadPositiveIntEnv("OPENTELEMETRY_METRICS_CARDINALITY_LIMIT", DefaultMetricsCardinalityLimit);
 
         try
         {
@@ -216,6 +241,7 @@ public static class TelemetryBuilder
                 .AddHttpClientInstrumentation()
                 .AddRuntimeInstrumentation()
                 .AddMeter("XiansAi.*")
+                .AddView(instrumentName: "*", new MetricStreamConfiguration { CardinalityLimit = metricsCardinalityLimit })
                 .AddOtlpExporter(options =>
                 {
                     options.Endpoint = new Uri(otlpEndpoint);
@@ -239,6 +265,7 @@ public static class TelemetryBuilder
             Console.WriteLine($"[OpenTelemetry] ✓ OpenTelemetry fully enabled for {serviceName}");
             Console.WriteLine($"[OpenTelemetry]   - Service: {serviceName} v{serviceVersion}");
             Console.WriteLine($"[OpenTelemetry]   - OTLP Endpoint: {otlpEndpoint}");
+            Console.WriteLine($"[OpenTelemetry]   - Metrics cardinality limit: {metricsCardinalityLimit}");
             Console.WriteLine("[OpenTelemetry]   - Note: If collector is unreachable, traces/metrics will be buffered or dropped (non-blocking)");
         }
         catch (Exception ex)

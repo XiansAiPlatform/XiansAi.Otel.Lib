@@ -25,6 +25,10 @@ High log volume from `Information`-level logs can be reduced with two env vars, 
 - `OPENTELEMETRY_LOGS_MIN_LEVEL` (default `Information`): minimum level logged at all. Set to `Warning` to turn off `Information`/`Debug`/`Trace` entirely.
 - `OPENTELEMETRY_LOGS_SAMPLING_RATIO` (default `1.0`, i.e. no sampling): fraction of `Information`-level logs to keep, e.g. `0.1` keeps ~10%. Implemented via .NET's built-in [`Microsoft.Extensions.Telemetry` log sampling](https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/log-sampling). Per Microsoft's own guidance, this only applies to `Information` — `Warning`/`Error`/`Critical` are never sampled, and `Trace`/`Debug` should be turned off via `OPENTELEMETRY_LOGS_MIN_LEVEL` above rather than sampled.
 
+## Metrics cardinality (optional)
+
+- `OPENTELEMETRY_METRICS_CARDINALITY_LIMIT` (default `2000`, matching the OpenTelemetry .NET SDK's own built-in default): max unique tag-combinations tracked per metric instrument before the SDK collapses the rest into a single overflow series (`otel.metric.overflow=true`). Raise this if metrics are hitting overflow. Note this is a cost/precision tradeoff, not a volume reduction — it's worth checking whether an unbounded tag (e.g. a raw user or tenant ID) is driving the cardinality before just raising the cap.
+
 ## GenAI sensitive content events (optional)
 
 If you want Semantic Kernel to include prompt/response **content** in `gen_ai.*` events (e.g. `gen_ai.event.content`), set:
