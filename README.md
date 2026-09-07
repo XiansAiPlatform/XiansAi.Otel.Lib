@@ -20,12 +20,35 @@ dotnet add package XiansAi.Otel.Lib
 
 ## Log sampling (optional)
 
-High log volume from `Information`-level logs can be reduced with two env vars, both defaulting to today's behavior — nothing changes unless you set them:
+High log volume from `Information`-level logs can be reduced. Everything below defaults to today's behavior — nothing changes unless you set these:
 
 - `OPENTELEMETRY_LOGS_MIN_LEVEL` (default `Information`): minimum level logged at all. Set to `Warning` to turn off `Information`/`Debug`/`Trace` entirely.
 - `OPENTELEMETRY_LOGS_SAMPLING_MODE` (default `ratio`): which sampling strategy to use — `ratio` or `trace`. Implemented via .NET's built-in [`Microsoft.Extensions.Telemetry` log sampling](https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/log-sampling). In both modes, `Warning`/`Error`/`Critical` are never sampled, and `Trace`/`Debug` should be turned off via `OPENTELEMETRY_LOGS_MIN_LEVEL` above rather than sampled.
-  - `ratio` — an independent random keep/drop decision per `Information` log line. Controlled by `OPENTELEMETRY_LOGS_SAMPLING_RATIO` (default `1.0`, i.e. no sampling), e.g. `0.1` keeps ~10% of `Information` lines. Simple, but a single request's log lines can end up partially kept and partially dropped.
-  - `trace` — keeps or drops **all** logs for a given request together, based on whether that request's trace was sampled. Gives you complete request stories instead of fragments, at the cost of losing whole requests instead of individual lines. This mode only reduces volume if trace sampling itself is also configured — see `OPENTELEMETRY_TRACES_SAMPLING_RATIO` below; otherwise every trace is kept and this is a no-op.
+
+### Mode: `ratio` — independent decision per log line
+
+Makes a separate random keep/drop decision for every `Information` log line. Simple, but one request's log lines can end up partially kept and partially dropped (you might see "started" and "finished" but lose the lines in between).
+
+| Env var | Purpose | Example |
+|---|---|---|
+| `OPENTELEMETRY_LOGS_SAMPLING_MODE` | Leave unset, or set to `ratio` | `ratio` |
+| `OPENTELEMETRY_LOGS_SAMPLING_RATIO` | Fraction of `Information` lines to keep (default `1.0` = no sampling) | `0.1` → keeps ~10% |
+
+### Mode: `trace` — whole request kept or dropped together
+
+Keeps or drops **all** logs for a given request together, based on whether that request's trace was sampled — you always see a request's complete story instead of a fragment, at the cost of losing entire requests instead of individual lines.
+
+This mode requires **both** settings below — `OPENTELEMETRY_TRACES_SAMPLING_RATIO` is what actually creates the reduction; `OPENTELEMETRY_LOGS_SAMPLING_RATIO` is ignored in this mode. If you set the mode to `trace` but leave the traces ratio at its default (`1.0`, every trace kept), nothing is reduced.
+
+| Env var | Purpose | Example |
+|---|---|---|
+| `OPENTELEMETRY_LOGS_SAMPLING_MODE` | Must be set to `trace` | `trace` |
+| `OPENTELEMETRY_TRACES_SAMPLING_RATIO` | Fraction of requests (traces) to keep — see [Trace sampling](#trace-sampling-optional) below | `0.1` → keeps ~10% of requests |
+
+### Which mode to pick
+
+- Want to simply cut `Information` log volume by roughly X%, and don't mind occasional gaps in a single request's story → **`ratio`** mode.
+- Want to always see a request's full, uninterrupted story when you do look at one, just fewer requests overall → **`trace`** mode.
 
 ## Trace sampling (optional)
 
