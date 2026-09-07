@@ -86,6 +86,63 @@ public static class TelemetryBuilder
                || v.Equals("on", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Matches the OpenTelemetry .NET SDK's own built-in default (<c>Metric.DefaultCardinalityLimit</c>)
+    /// so that not setting <c>OPENTELEMETRY_METRICS_CARDINALITY_LIMIT</c> preserves current behavior.
+    /// </summary>
+    private const int DefaultMetricsCardinalityLimit = 2000;
+
+    private static int ReadPositiveIntEnv(string key, int defaultValue)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return defaultValue;
+        }
+
+        if (!int.TryParse(raw, out var value) || value <= 0)
+        {
+            Console.WriteLine($"[OpenTelemetry] Invalid value for {key}='{raw}' (expected a positive integer), using default {defaultValue}.");
+            return defaultValue;
+        }
+
+        return value;
+    }
+
+    private static double ReadRatioEnv(string key, double defaultValue)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return defaultValue;
+        }
+
+        if (!double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var value))
+        {
+            Console.WriteLine($"[OpenTelemetry] Invalid value for {key}='{raw}' (expected a number between 0 and 1), using default {defaultValue}.");
+            return defaultValue;
+        }
+
+        return Math.Clamp(value, 0.0, 1.0);
+    }
+
+    private static LogLevel ReadLogLevelEnv(string key, LogLevel defaultValue)
+    {
+        var raw = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return defaultValue;
+        }
+
+        if (!Enum.TryParse<LogLevel>(raw, ignoreCase: true, out var value))
+        {
+            Console.WriteLine($"[OpenTelemetry] Invalid value for {key}='{raw}', using default {defaultValue}.");
+            return defaultValue;
+        }
+
+        return value;
+    }
+
     private static void InitializeFromEnvironment(
         string? defaultServiceName = null,
         string? tenantId = null,
@@ -109,6 +166,9 @@ public static class TelemetryBuilder
 
         Console.WriteLine($"[OpenTelemetry] Initializing OpenTelemetry for service: {serviceName}");
         Console.WriteLine($"[OpenTelemetry] OTLP Endpoint: {otlpEndpoint}");
+
+        var metricsCardinalityLimit = ReadPositiveIntEnv("OPENTELEMETRY_METRICS_CARDINALITY_LIMIT", DefaultMetricsCardinalityLimit);
+        var tracesSamplingRatio = ReadRatioEnv("OPENTELEMETRY_TRACES_SAMPLING_RATIO", 1.0);
 
         try
         {
@@ -140,6 +200,7 @@ public static class TelemetryBuilder
                 .AddAttributes(attrs);
 
             var tracerBuilder = Sdk.CreateTracerProviderBuilder()
+                .SetSampler(new ParentBasedSampler(new TraceIdRatioBasedSampler(tracesSamplingRatio)))
                 .SetResourceBuilder(resourceBuilder)
                 .AddSource("XiansAi.*")
                 .AddHttpClientInstrumentation(options =>
@@ -182,6 +243,7 @@ public static class TelemetryBuilder
                 .AddHttpClientInstrumentation()
                 .AddRuntimeInstrumentation()
                 .AddMeter("XiansAi.*")
+                .AddView(instrumentName: "*", new MetricStreamConfiguration { CardinalityLimit = metricsCardinalityLimit })
                 .AddOtlpExporter(options =>
                 {
                     options.Endpoint = new Uri(otlpEndpoint);
@@ -205,6 +267,8 @@ public static class TelemetryBuilder
             Console.WriteLine($"[OpenTelemetry] ✓ OpenTelemetry fully enabled for {serviceName}");
             Console.WriteLine($"[OpenTelemetry]   - Service: {serviceName} v{serviceVersion}");
             Console.WriteLine($"[OpenTelemetry]   - OTLP Endpoint: {otlpEndpoint}");
+            Console.WriteLine($"[OpenTelemetry]   - Traces sampling ratio: {tracesSamplingRatio:0.###}");
+            Console.WriteLine($"[OpenTelemetry]   - Metrics cardinality limit: {metricsCardinalityLimit}");
             Console.WriteLine("[OpenTelemetry]   - Note: If collector is unreachable, traces/metrics will be buffered or dropped (non-blocking)");
         }
         catch (Exception ex)
@@ -332,9 +396,40 @@ public static class TelemetryBuilder
             Environment.GetEnvironmentVariable("OPENTELEMETRY_LOGS_ENDPOINT")
             ?? Environment.GetEnvironmentVariable("OPENTELEMETRY_ENDPOINT");
 
+        var minLevel = ReadLogLevelEnv("OPENTELEMETRY_LOGS_MIN_LEVEL", LogLevel.Information);
+        var samplingRatio = ReadRatioEnv("OPENTELEMETRY_LOGS_SAMPLING_RATIO", 1.0);
+
+        // "ratio" (default): independent random keep/drop decision per log line.
+        // "trace": keep/drop all logs for a given trace together, based on whether that trace was
+        // sampled (see OPENTELEMETRY_TRACES_SAMPLING_RATIO) — set that too, or this is a no-op.
+        var samplingMode = (Environment.GetEnvironmentVariable("OPENTELEMETRY_LOGS_SAMPLING_MODE") ?? "ratio").Trim().ToLowerInvariant();
+        if (samplingMode is not ("ratio" or "trace"))
+        {
+            Console.WriteLine($"[OpenTelemetry] Invalid OPENTELEMETRY_LOGS_SAMPLING_MODE='{samplingMode}' (expected 'ratio' or 'trace'), using 'ratio'.");
+            samplingMode = "ratio";
+        }
+
         return LoggerFactory.Create(builder =>
         {
-            builder.SetMinimumLevel(LogLevel.Information);
+            builder.SetMinimumLevel(minLevel);
+
+            if (samplingMode == "trace")
+            {
+                builder.AddTraceBasedSampler();
+                Console.WriteLine(
+                    "[OpenTelemetry] Log sampling enabled: trace-based (a request's logs are kept or dropped " +
+                    "together, based on whether its trace was sampled — see OPENTELEMETRY_TRACES_SAMPLING_RATIO).");
+            }
+            else if (samplingRatio < 1.0)
+            {
+                // Per Microsoft's log-sampling guidance, sampling is intended for Information-level
+                // logs. Trace/Debug should be turned off via OPENTELEMETRY_LOGS_MIN_LEVEL instead of
+                // sampled, and Warning/Error/Critical are left untouched here.
+                builder.AddRandomProbabilisticSampler(samplingRatio, LogLevel.Information);
+                Console.WriteLine(
+                    $"[OpenTelemetry] Log sampling enabled: keeping {samplingRatio:0.###} of Information-level logs " +
+                    "(Warning and above unaffected).");
+            }
 
             builder.AddSimpleConsole(options =>
             {
